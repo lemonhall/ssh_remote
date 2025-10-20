@@ -3,9 +3,10 @@
 import asyncio
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 
 import pyte
+import paramiko
 from prompt_toolkit.application import Application
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import (
@@ -14,15 +15,75 @@ from prompt_toolkit.layout import (
     Window,
     Layout,
     FormattedTextControl,
+    UIControl,
+    UIContent,
+    ConditionalContainer,
+    FloatContainer,
+    Float,
 )
 from prompt_toolkit.widgets import TextArea, Frame
 from prompt_toolkit.formatted_text import ANSI, HTML
-from prompt_toolkit.styles import Style
 from prompt_toolkit.filters import Condition
-import paramiko
 
 from ssh_remote.models import Server, AuthMethod
 from ssh_remote.services.ai_service import AIAssistant
+
+
+class TerminalInputControl(UIControl):
+    """
+    自定义的终端控件：显示SSH终端输出
+    
+    注意：键盘输入由全局键绑定处理（带条件过滤器）
+    这个控件只负责显示内容
+    """
+    
+    def __init__(self, terminal_text_getter: Callable[[], str]):
+        """
+        Args:
+            terminal_text_getter: 获取终端显示文本的函数
+        """
+        self.terminal_text_getter = terminal_text_getter
+    
+    def create_content(self, width: int, height: int) -> UIContent:
+        """
+        创建显示内容：显示SSH终端输出（带ANSI颜色）
+        """
+        terminal_text = self.terminal_text_getter()
+        
+        # 将文本分割成行
+        lines = terminal_text.split('\n')
+        
+        # 确保至少有 height 行
+        while len(lines) < height:
+            lines.append('')
+        
+        # 只取需要的行数
+        lines = lines[:height]
+        
+        def get_line(i):
+            if i < len(lines):
+                # ANSI 对象需要转换为 formatted text 列表
+                # ANSI 对象本身就是一个可迭代的 formatted text
+                # 但我们需要调用它来获取片段列表
+                ansi_text = ANSI(lines[i])
+                # ANSI 类实现了 __pt_formatted_text__() 方法
+                # 直接返回它即可，prompt_toolkit 会自动处理
+                return ansi_text.__pt_formatted_text__()
+            return []
+        
+        return UIContent(
+            get_line=get_line,
+            line_count=len(lines),
+            cursor_position=None,  # 光标由SSH服务器控制
+        )
+    
+    def is_focusable(self) -> bool:
+        """允许获得焦点"""
+        return True
+    
+    def mouse_handler(self, mouse_event):
+        """鼠标事件处理（可选）"""
+        return NotImplemented
 
 
 class SSHTerminalSession:
@@ -250,19 +311,13 @@ class TerminalApp:
         self.running = False
         self.terminal_focused = True  # 焦点状态：True=终端，False=聊天
         
-        # 终端显示（支持ANSI颜色）
+        # 终端显示文本
         self.terminal_text = ""
-        self.terminal_display = FormattedTextControl(
-            text=lambda: ANSI(self.terminal_text)
-        )
         
-        # 创建一个隐藏的虚拟Widget作为终端模式的焦点目标
-        # 这样可以避免 focus(None) 的错误，同时让我们的键绑定正常工作
-        self.dummy_control = TextArea(
-            text="",
-            height=0,  # 高度为0，不可见
-            focusable=True,
-            read_only=False,  # 必须是可写的，否则无法接收输入
+        # ⭐ 创建自定义的终端控件（只负责显示）
+        # 输入由全局键绑定处理
+        self.terminal_input_control = TerminalInputControl(
+            terminal_text_getter=lambda: self.terminal_text,
         )
         
         # AI聊天区域（只读）
@@ -292,37 +347,32 @@ class TerminalApp:
         # 创建按键绑定
         self.kb = self._create_key_bindings()
         
-        # 为 dummy_control 创建专门的键绑定
-        self.dummy_kb = self._create_dummy_key_bindings()
-        self.dummy_control.control.key_bindings = self.dummy_kb
-        
         # 创建应用
         self.app = Application(
             layout=self.layout,
             key_bindings=self.kb,
             full_screen=True,
             mouse_support=True,
-            # 确保始终处理我们的键绑定
             enable_page_navigation_bindings=False,
         )
     
     def _create_layout(self) -> Layout:
         """创建应用布局（双面板+状态栏）"""
         
-        # 左侧：SSH终端（虚拟终端，不接受直接焦点）
+        # ⭐ 左侧：SSH终端窗口
+        # 显示由自定义控件处理，输入由全局键绑定+条件过滤器处理
+        self.terminal_input_window = Window(
+            content=self.terminal_input_control,
+            wrap_lines=False,
+            always_hide_cursor=False,
+        )
+        
         terminal_window = Frame(
-            Window(
-                content=self.terminal_display,
-                wrap_lines=False,
-                always_hide_cursor=False,
-            ),
+            self.terminal_input_window,
             title=lambda: "🖥️  SSH Terminal" + (" [FOCUS]" if self.terminal_focused else ""),
         )
         
         # 右侧：AI聊天
-        # 创建一个条件性的输入框容器
-        from prompt_toolkit.layout import ConditionalContainer
-        
         chat_container = HSplit([
             Frame(self.chat_area, title="💬 Chat History"),
             # 输入框只在聊天模式下可见并可用
@@ -352,109 +402,110 @@ class TerminalApp:
             style="bg:#444444 #ffffff",
         )
         
-        # 主布局：左右分栏 + 底部状态栏 + 隐藏的虚拟控件
+        # 主布局：左右分栏 + 底部状态栏
         root = HSplit([
             VSplit([
                 terminal_window,  # 左侧终端（60%宽度）
                 chat_container,   # 右侧聊天（40%宽度）
             ]),
             status_bar,
-            self.dummy_control,  # 隐藏的虚拟控件（用于终端模式焦点）
         ])
         
         return Layout(root)
     
-    def _create_dummy_key_bindings(self) -> KeyBindings:
-        """为虚拟控件创建键绑定（拦截所有输入并转发到SSH）"""
-        kb = KeyBindings()
-        
-        # 拦截所有按键并转发到SSH
-        @kb.add('<any>')
-        def _(event):
-            """转发所有按键到SSH"""
-            if self.ssh_session and self.ssh_session.connected:
-                # 获取按键信息
-                key = event.key_sequence[0].key
-                
-                # 处理特殊键
-                if key == 'enter':
-                    self.ssh_session.send_key('enter')
-                elif key == 'backspace':
-                    self.ssh_session.send_key('backspace')
-                elif key == 'tab':
-                    self.ssh_session.send_key('tab')
-                elif key == 'escape':
-                    self.ssh_session.send_key('escape')
-                elif key == 'up':
-                    self.ssh_session.send_key('up')
-                elif key == 'down':
-                    self.ssh_session.send_key('down')
-                elif key == 'left':
-                    self.ssh_session.send_key('left')
-                elif key == 'right':
-                    self.ssh_session.send_key('right')
-                elif key == 'home':
-                    self.ssh_session.send_key('home')
-                elif key == 'end':
-                    self.ssh_session.send_key('end')
-                elif key == 'pageup':
-                    self.ssh_session.send_key('pageup')
-                elif key == 'pagedown':
-                    self.ssh_session.send_key('pagedown')
-                elif key == 'delete':
-                    self.ssh_session.send_key('delete')
-                elif key.startswith('c-') and len(key) == 3:
-                    # Ctrl组合键
-                    char = key[2]
-                    if char == 'q':
-                        # Ctrl+Q 退出，不转发
-                        event.app.exit()
-                    elif char == 't':
-                        # Ctrl+T 切换焦点，不转发
-                        self.terminal_focused = False
-                        self._update_status()
-                        event.app.layout.focus(self.input_field)
-                    else:
-                        self.ssh_session.send_ctrl_key(char)
-                elif len(key) == 1:
-                    # 普通字符
-                    self.ssh_session.send_input(key)
-        
-        return kb
+    def _switch_to_chat(self):
+        """切换到聊天模式"""
+        self.terminal_focused = False
+        self._update_status()
+        self.app.layout.focus(self.input_field)
+    
+    def _switch_to_terminal(self):
+        """切换到终端模式"""
+        self.terminal_focused = True
+        self._update_status()
+        # 直接聚焦到我们保存的输入窗口
+        self.app.layout.focus(self.terminal_input_window)
     
     def _create_key_bindings(self) -> KeyBindings:
-        """创建按键绑定"""
+        """创建全局按键绑定"""
         kb = KeyBindings()
         
-        # ========== 全局快捷键 ==========
+        # ========== 条件过滤器 ==========
+        is_terminal_focused = Condition(lambda: self.terminal_focused)
+        is_chat_focused = Condition(lambda: not self.terminal_focused)
         
-        @kb.add('c-q')
+        # ========== 终端模式的所有按键（从 TerminalInputControl 复制过来）==========
+        # ⭐ 关键改变：将控件的键绑定移到全局，并添加 filter 条件
+        
+        @kb.add('c-q', filter=is_terminal_focused)
         def _(event):
-            """Ctrl-Q: 退出应用"""
+            """Ctrl+Q: 退出应用（终端模式）"""
             event.app.exit()
         
-        @kb.add('c-t')
+        @kb.add('c-t', filter=is_terminal_focused)
         def _(event):
-            """Ctrl-T: 切换焦点（终端 ↔ 聊天）"""
-            self.terminal_focused = not self.terminal_focused
-            self._update_status()
-            
-            # 切换焦点时，更新输入框的焦点状态
-            if not self.terminal_focused:
-                # 切换到聊天模式，给输入框焦点
-                event.app.layout.focus(self.input_field)
-            else:
-                # 切换到终端模式，给虚拟控件焦点（让我们的键绑定生效）
-                event.app.layout.focus(self.dummy_control)
+            """Ctrl+T: 切换到聊天模式"""
+            self._switch_to_chat()
         
-        # ========== AI聊天焦点时的按键处理 ==========
-        # 注意：终端模式的按键由 dummy_control 的键绑定处理
+        # 功能键
+        @kb.add('enter', filter=is_terminal_focused)
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('enter')
         
-        is_chat_focused = Condition(lambda: not self.terminal_focused)
+        @kb.add('backspace', filter=is_terminal_focused)
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('backspace')
+        
+        @kb.add('tab', filter=is_terminal_focused)
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('tab')
+        
+        @kb.add('escape', filter=is_terminal_focused)
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('escape')
+        
+        # 方向键
+        for key in ['up', 'down', 'left', 'right', 'home', 'end', 'pageup', 'pagedown', 'delete']:
+            @kb.add(key, filter=is_terminal_focused)
+            def _(event, k=key):
+                if self.ssh_session and self.ssh_session.connected:
+                    self.ssh_session.send_key(k)
+        
+        # Ctrl 组合键（除了 Q 和 T）
+        for char in 'abcdefghijklmnoprsuvwxyz':  # 排除 q, t
+            @kb.add(f'c-{char}', filter=is_terminal_focused)
+            def _(event, c=char):
+                if self.ssh_session and self.ssh_session.connected:
+                    self.ssh_session.send_ctrl_key(c)
+        
+        # 普通字符（使用 <any> 通配符）
+        @kb.add('<any>', filter=is_terminal_focused)
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                key = event.key_sequence[0].key
+                # 确保是单个字符
+                if len(key) == 1:
+                    self.ssh_session.send_input(key)
+        
+        # ========== 聊天模式的快捷键 ==========
+        
+        @kb.add('c-q', filter=is_chat_focused)
+        def _(event):
+            """Ctrl+Q: 退出应用（聊天模式）"""
+            event.app.exit()
+        
+        @kb.add('c-t', filter=is_chat_focused)
+        def _(event):
+            """Ctrl+T: 切换到终端模式"""
+            self._switch_to_terminal()
         
         @kb.add('enter', filter=is_chat_focused)
         async def _(event):
-            """发送AI消息"""
+            """Enter: 发送AI消息"""
             await self._handle_ai_input()
         
         return kb
@@ -582,8 +633,8 @@ class TerminalApp:
         # 启动显示更新任务
         asyncio.ensure_future(self.update_terminal_display())
         
-        # 设置初始焦点（终端模式，给虚拟控件焦点）
-        self.app.layout.focus(self.dummy_control)
+        # 设置初始焦点到终端输入控件
+        self._switch_to_terminal()
         
         # 运行应用
         try:

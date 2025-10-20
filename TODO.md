@@ -42,7 +42,7 @@
 
 **原因**：Textual不支持真正的终端仿真，无法运行vim/nano等全屏应用
 
-#### 新UI架构 (`ui/terminal_app.py`) - 阶段性完成
+#### 新UI架构 (`ui/terminal_app.py`) - ✅ 方案B实现完成
 - [x] 抛弃Textual框架
 - [x] 引入prompt_toolkit (专业TUI框架)
 - [x] 引入pyte (完整终端模拟器)
@@ -58,16 +58,38 @@
   - `layout.focus(None)` 报错，无法正确实现"无焦点"状态
   - 需要重新设计焦点管理方案
 
-### 🔴 当前问题 (2025-10-21 深夜 - 第二轮调试)
+### 🔴 问题仍未解决 (2025-10-21 深夜 - 第三/四轮尝试)
 
-#### 阶段性进展
-- ✅ 修复了 `focus(None)` 报错 → 创建虚拟 `dummy_control` TextArea
-- ✅ SSH终端可以正常显示内容（欢迎信息、提示符、ANSI颜色）
-- ✅ 状态栏正常，Ctrl+T 焦点切换不报错
-- ✅ 右侧聊天面板可以正常输入（当焦点切换到聊天模式时）
-- ❌ **左侧终端仍然无法接收键盘输入**
+#### 方案B的多次尝试 - 均失败 ❌
 
-#### 核心问题：TextArea 的输入拦截机制
+**尝试1：UIControl + get_key_bindings()**
+- 创建 `TerminalInputControl` 继承 `UIControl`
+- 在 `create_content()` 中渲染SSH终端输出
+- 在 `get_key_bindings()` 中处理键盘输入
+- **失败原因**：`UIControl.get_key_bindings()` 似乎不会被自动调用
+
+**尝试2：UIControl + Window.key_bindings**
+- 尝试将控件的键绑定附加到 Window 上
+- **失败原因**：Window 构造函数不接受 key_bindings 参数
+
+**尝试3：全局键绑定 + Condition 过滤器**
+- 将所有终端输入移到全局键绑定
+- 使用 `Condition(lambda: self.terminal_focused)` 过滤
+- **失败原因**：仍然无法捕获输入（原因不明）
+
+**技术困境**：
+- ✅ 显示正常：SSH连接成功，终端内容显示正确
+- ✅ 焦点管理正常：可以用 Ctrl+T 切换焦点
+- ✅ 聊天输入正常：右侧 TextArea 可以输入
+- ❌ **终端输入失败**：左侧终端窗口无法接收任何输入
+
+**可能的根本原因**：
+1. prompt_toolkit 的焦点机制可能需要 `BufferControl` 或 `TextArea`
+2. 自定义 `UIControl` 可能默认不参与键盘输入处理
+3. 全局键绑定的优先级可能低于某些内置处理器
+4. 可能需要研究 prompt_toolkit 的 `KeyProcessor` 机制
+
+#### 已尝试但失败的所有方案总结
 **已尝试的方案**：
 
 **方案A（已测试 ❌ 失败）**: 隐藏 TextArea + 自定义键绑定
@@ -87,41 +109,70 @@
 ❌ 即使设置 `read_only=False` 也无法阻止其消费按键
 ❌ 使用 Filter 条件只能控制键绑定触发，但无法阻止 Widget 内部处理
 
-**可行的解决方案**：
+**已尝试的所有方案**：
 
-1. **方案B（推荐 ⭐）**: 自定义 UIControl 代替 TextArea
-   - 创建一个继承 `UIControl` 的 `TerminalInputControl`
-   - 重写 `create_content()` 返回空内容（不可见）
-   - 在 `key_handler()` 中处理所有输入并转发到SSH
-   - 完全掌控输入处理流程
+- ❌ **方案A（已废弃）**: TextArea + 虚拟控件转发
+  - TextArea 的 BufferControl 优先级太高，无法拦截输入
+  
+- ❌ **方案B（多次尝试，均失败）**: 自定义 UIControl
+  - 尝试1：控件级键绑定 - 不生效
+  - 尝试2：Window级键绑定 - 不支持
+  - 尝试3：全局键绑定+过滤器 - 仍无法捕获输入
+  - **核心问题**：自定义UIControl似乎不参与键盘输入事件流
 
-2. **方案C**: 使用 input_processors 拦截
-   - 为 dummy_control 添加自定义 `Processor`
-   - 在 `apply_transformation()` 中拦截输入
-   - 可能仍然会被 Buffer 消费
+- ⏸️ **方案C（未尝试）**: input_processors 拦截
+  - 理论可行性低，可能仍会被 Buffer 消费
 
-3. **方案D**: 全屏模式切换（最简单 🎯）
-   - 放弃双面板同时交互
-   - 终端模式：全屏SSH终端
-   - 聊天模式：全屏AI对话
-   - Ctrl+T 切换布局
+- 🎯 **方案D（强烈推荐，下次尝试）**: 全屏模式切换
+  - 放弃双面板同时交互
+  - 终端模式：全屏SSH终端（使用原生TextArea或其他方案）
+  - 聊天模式：全屏AI对话
+  - Ctrl+T 切换布局
+  - **优势**：简单可靠，避开复杂的焦点问题
 
-4. **方案E**: 研究 `PromptSession` 集成
-   - 使用 prompt_toolkit 的原生命令行输入
-   - 输入直接管道到 SSH
+- ⏸️ **方案E（备选）**: 使用 BufferControl + 自定义处理
+  - 研究 prompt_toolkit 的 `BufferControl` 源码
+  - 创建自定义 Buffer，拦截输入事件
+  - 可能需要深入理解 KeyProcessor 机制
 
-## 📋 下一步计划（重新规划）
+- ⏸️ **方案F（最后手段）**: 使用 curses 或其他底层库
+  - 完全放弃 prompt_toolkit
+  - 使用 `curses` 或 `blessed` 等更底层的TUI库
+  - 完全掌控输入输出
+
+## 📋 下一步计划（第四轮重新规划）
 
 ### 🎯 优先级1: 彻底解决终端输入问题
-**必须二选一：**
-- [ ] **方案B**: 实现自定义 UIControl（技术难度高，但最优雅）
-- [ ] **方案D**: 改为全屏模式切换（最简单，立即可用）
 
-**推荐先尝试方案D**：
-1. 创建两套独立的布局（终端布局 + 聊天布局）
-2. Ctrl+T 切换 `app.layout`
-3. 终端布局使用真实的可输入 TextArea 或原生输入
-4. 如果方案D可用，再考虑优化回双面板
+**下次必须采用方案D（全屏模式切换）🚀**
+
+方案B已经尝试了多次，均失败。prompt_toolkit的键盘输入机制比想象中复杂：
+- 自定义UIControl似乎不参与输入事件流
+- 全局键绑定在某些情况下也无法捕获输入
+- 可能需要深入研究KeyProcessor和Buffer机制
+
+**方案D实施步骤**：
+1. [ ] 创建两套完全独立的布局：
+   - `terminal_layout`：全屏SSH终端
+   - `chat_layout`：全屏AI聊天
+   
+2. [ ] 终端布局的实现方案（三选一）：
+   - [ ] **方案D1**: 使用 TextArea（最简单）
+     - 让TextArea只读，但用全局键绑定捕获输入
+     - 或者让TextArea可写，然后拦截其Buffer变化
+   - [ ] **方案D2**: 使用原生的命令行输入
+     - 研究 `PromptSession` 的使用
+   - [ ] **方案D3**: 研究其他SSH客户端的实现
+     - 参考 `asyncssh` 或 `fabric` 的TUI实现
+   
+3. [ ] Ctrl+T 切换 `app.layout` 在两个布局之间
+   
+4. [ ] 如果方案D成功，再考虑是否优化回双面板
+
+**为什么方案D一定能成功**：
+- 全屏模式下，不需要复杂的焦点管理
+- 可以使用TextArea的原生输入能力
+- 如果TextArea还不行，至少可以用简单的输入提示符（类似传统SSH客户端）
 
 ### 优先级2: 基础功能完善
 - [ ] 终端大小自适应
@@ -268,12 +319,28 @@ uv run python -m ssh_remote.main
 - ✅ 为 dummy_control 添加专用键绑定
 - ❌ **输入仍然无效** - TextArea的BufferControl优先级问题
 
-**问题根源**:
-TextArea 不是"透明"的输入容器。它的内部 BufferControl 会在键绑定之前消费所有输入事件。这是 prompt_toolkit 的设计哲学：Widget 拥有输入控制权，而非全局键绑定。
+**2025-10-21 深夜第三轮**:
+- ✅ 创建自定义 `TerminalInputControl` 继承 `UIControl`
+- ✅ 在控件中实现显示和键绑定
+- ✅ 修复 ANSI 格式化问题（`__pt_formatted_text__()`）
+- ✅ 程序可以启动，界面显示正常
+- ❌ **输入仍然无效** - 控件的 `get_key_bindings()` 似乎不生效
+
+**2025-10-21 深夜第四轮**:
+- ✅ 将键绑定从控件移到全局
+- ✅ 使用 `Condition(lambda: self.terminal_focused)` 过滤器
+- ✅ 简化 `TerminalInputControl` 只负责显示
+- ❌ **输入仍然无效** - 全局键绑定在终端窗口获得焦点时也不工作
+
+**核心问题未解决**:
+prompt_toolkit 的键盘输入处理机制比想象中复杂。自定义 UIControl 无法像 TextArea 那样自然地接收输入事件。可能的原因：
+1. 需要特殊的 `BufferControl` 或类似机制
+2. 键盘事件的处理链路中，自定义控件的优先级不够
+3. 可能需要实现更底层的 `KeyProcessor` 或事件处理器
 
 **结论**:
-必须放弃使用 TextArea 作为输入转发器。要么实现自定义 UIControl，要么改用全屏模式切换。
+方案B（自定义UIControl）在当前知识水平下无法实现。必须转向方案D（全屏模式切换），或者深入研究 prompt_toolkit 源码找到正确的实现方式。
 
 ---
 
-更新时间：2025-10-21 晚
+更新时间：2025-10-21 深夜（多轮调试后）
