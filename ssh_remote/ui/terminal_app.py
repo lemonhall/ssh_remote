@@ -109,11 +109,7 @@ class SSHTerminalSession:
     def send_input(self, data: str):
         """发送输入到SSH通道"""
         if self.channel and self.connected:
-            # print(f"[DEBUG] send_input: 发送 {data!r}")
             self.channel.send(data)
-            # ⭐ 立即尝试读取回显（给一点时间）
-            import time
-            time.sleep(0.01)  # 等待10ms让服务器回显
     
     def send_key(self, key: str):
         """发送特殊按键"""
@@ -152,13 +148,10 @@ class SSHTerminalSession:
             return ""
         
         try:
-            # ⭐ 先检查 recv_ready
-            ready = self.channel.recv_ready()
-            # print(f"[DEBUG] recv_ready: {ready}")  # 太频繁，注释掉
-            
-            if ready:
+            # 检查是否有数据
+            if self.channel.recv_ready():
                 data = self.channel.recv(4096).decode('utf-8', errors='replace')
-                # print(f"[DEBUG] read_output: 收到 {len(data)} 字节: {data[:50]!r}")
+                
                 # 保存原始输出（包含ANSI颜色）
                 self.output_buffer += data
                 # 限制缓冲区大小
@@ -166,29 +159,36 @@ class SSHTerminalSession:
                     self.output_buffer = self.output_buffer[-40000:]
                 # 更新终端屏幕
                 self.stream.feed(data)
-                # print(f"[DEBUG] pyte屏幕已更新，光标位置: {self.screen.cursor.y}, {self.screen.cursor.x}")
                 return data
-            else:
-                # ⭐ 尝试强制读取（即使 recv_ready 为 False）
-                # 使用 select 或 直接尝试 recv（可能会阻塞）
-                # 暂时不做，先看看问题在哪
-                pass
+                
         except Exception as e:
-            print(f"[DEBUG] read_output 异常: {e}")
+            pass
         
         return ""
     
-    def get_display(self) -> str:
-        """获取当前屏幕显示内容（纯文本）"""
+    def get_display(self, show_cursor: bool = True) -> str:
+        """获取当前屏幕显示内容（纯文本，可选显示光标）"""
         lines = []
+        cursor_y = self.screen.cursor.y
+        cursor_x = self.screen.cursor.x
+        
         for line_idx in range(self.screen.lines):
-            line_text = ""
+            line_chars = []
             for col_idx in range(self.screen.columns):
+                # 获取当前位置的字符
                 if col_idx in self.screen.buffer[line_idx]:
-                    line_text += self.screen.buffer[line_idx][col_idx].data
+                    char = self.screen.buffer[line_idx][col_idx].data
                 else:
-                    line_text += " "
-            lines.append(line_text.rstrip())
+                    char = " "
+                
+                # 如果是光标位置且需要显示光标，使用反色效果（ANSI转义序列）
+                if show_cursor and line_idx == cursor_y and col_idx == cursor_x:
+                    # 使用反色显示光标 (反转前景色和背景色)
+                    line_chars.append(f"\x1b[7m{char}\x1b[27m")
+                else:
+                    line_chars.append(char)
+            
+            lines.append(''.join(line_chars).rstrip())
         return "\n".join(lines)
     
     def get_colored_display(self) -> str:
@@ -280,10 +280,10 @@ class TerminalApp:
         # ⭐ 使用 FormattedTextControl 显示终端内容
         # FormattedTextControl 支持 key_bindings 并且更适合显示动态内容
         self.terminal_control = FormattedTextControl(
-            text=lambda: self.terminal_text,  # 动态获取内容
+            text=lambda: ANSI(self.terminal_text),  # 动态获取内容，支持ANSI转义序列
             key_bindings=self.terminal_kb,
             focusable=True,
-            show_cursor=False,  # 暂时隐藏光标
+            show_cursor=False,  # 使用自定义光标（在文本中）
         )
         
         # AI聊天区域（只读）
@@ -334,39 +334,28 @@ class TerminalApp:
         def _(event):
             if self.ssh_session and self.ssh_session.connected:
                 self.ssh_session.send_key('enter')
-                # ⭐ Enter 后等待命令执行结果，持续读取
-                import time
-                max_attempts = 30  # 最多尝试30次（600ms），给命令执行更多时间
-                no_data_count = 0
                 
-                for attempt in range(max_attempts):
+                # ⚡ Enter后等待命令执行（最多5秒，适应高延迟服务器）
+                import time
+                for _ in range(250):  # 250次 x 20ms = 5000ms (5秒)
                     time.sleep(0.02)
                     output = self.ssh_session.read_output()
-                    
                     if output:
-                        self.terminal_text = self.ssh_session.get_display()
+                        self.terminal_text = self.ssh_session.get_display(show_cursor=True)
                         event.app.invalidate()
-                        no_data_count = 0
-                    else:
-                        no_data_count += 1
-                        # Enter后需要更长的等待时间，因为可能有命令执行
-                        if no_data_count >= 5:  # 连续5次（100ms）没数据才停止
-                            break
-            # ⭐ 不要调用 event.current_buffer 的任何方法
-            # 让键绑定"吞掉"这个事件
         
         # Backspace
         @kb.add('backspace', eager=True)
         def _(event):
             if self.ssh_session and self.ssh_session.connected:
                 self.ssh_session.send_key('backspace')
-                # 立即读取回显
+                
                 import time
-                for _ in range(5):
+                for _ in range(250):  # 5秒
                     time.sleep(0.02)
                     output = self.ssh_session.read_output()
                     if output:
-                        self.terminal_text = self.ssh_session.get_display()
+                        self.terminal_text = self.ssh_session.get_display(show_cursor=True)
                         event.app.invalidate()
                         break
         
@@ -387,13 +376,12 @@ class TerminalApp:
         def _(event):
             if self.ssh_session and self.ssh_session.connected:
                 self.ssh_session.send_key('up')
-                # 方向键也需要读取回显（可能有命令历史）
                 import time
-                for _ in range(10):
+                for _ in range(250):  # 5秒
                     time.sleep(0.02)
                     output = self.ssh_session.read_output()
                     if output:
-                        self.terminal_text = self.ssh_session.get_display()
+                        self.terminal_text = self.ssh_session.get_display(show_cursor=True)
                         event.app.invalidate()
                         break
         
@@ -402,11 +390,11 @@ class TerminalApp:
             if self.ssh_session and self.ssh_session.connected:
                 self.ssh_session.send_key('down')
                 import time
-                for _ in range(10):
+                for _ in range(250):  # 5秒
                     time.sleep(0.02)
                     output = self.ssh_session.read_output()
                     if output:
-                        self.terminal_text = self.ssh_session.get_display()
+                        self.terminal_text = self.ssh_session.get_display(show_cursor=True)
                         event.app.invalidate()
                         break
         
@@ -415,11 +403,11 @@ class TerminalApp:
             if self.ssh_session and self.ssh_session.connected:
                 self.ssh_session.send_key('left')
                 import time
-                for _ in range(5):
+                for _ in range(250):  # 5秒
                     time.sleep(0.02)
                     output = self.ssh_session.read_output()
                     if output:
-                        self.terminal_text = self.ssh_session.get_display()
+                        self.terminal_text = self.ssh_session.get_display(show_cursor=True)
                         event.app.invalidate()
                         break
         
@@ -428,11 +416,11 @@ class TerminalApp:
             if self.ssh_session and self.ssh_session.connected:
                 self.ssh_session.send_key('right')
                 import time
-                for _ in range(5):
+                for _ in range(250):  # 5秒
                     time.sleep(0.02)
                     output = self.ssh_session.read_output()
                     if output:
-                        self.terminal_text = self.ssh_session.get_display()
+                        self.terminal_text = self.ssh_session.get_display(show_cursor=True)
                         event.app.invalidate()
                         break
         
@@ -487,28 +475,16 @@ class TerminalApp:
                 if self.ssh_session and self.ssh_session.connected:
                     self.ssh_session.send_input(c)
                     
-                    # ⭐ 立即读取输出并更新显示
-                    # 对于远程服务器，持续读取直到没有新数据
+                    # ⚡ 轮询读取回显（最多5秒，适应高延迟服务器）
                     import time
-                    max_attempts = 10  # 最多尝试10次（200ms）
-                    no_data_count = 0  # 连续没数据的次数
-                    
-                    for attempt in range(max_attempts):
-                        time.sleep(0.02)  # 每次等待20ms
+                    for _ in range(250):  # 250次 x 20ms = 5000ms (5秒)
+                        time.sleep(0.02)
                         output = self.ssh_session.read_output()
-                        
                         if output:
-                            # 有数据，立即更新显示
-                            self.terminal_text = self.ssh_session.get_display()
+                            # 有数据就立即更新显示并退出
+                            self.terminal_text = self.ssh_session.get_display(show_cursor=True)
                             event.app.invalidate()
-                            no_data_count = 0  # 重置计数器
-                        else:
-                            no_data_count += 1
-                            # 如果连续2次（40ms）没数据，认为回显完成
-                            if no_data_count >= 2:
-                                break
-                # ⭐ 不调用 event.current_buffer.insert_text()
-                # 这样字符就不会被插入到 Buffer 中
+                            break
         
         return kb
     
@@ -723,30 +699,25 @@ class TerminalApp:
             return False
     
     async def update_terminal_display(self):
-        """更新终端显示（实时刷新）"""
-        last_text = ""
+        """更新终端显示（光标闪烁）"""
+        import time
+        cursor_visible = True
+        last_cursor_toggle = time.time()
+        
         while self.running:
             if self.ssh_session and self.ssh_session.connected:
-                # 读取SSH输出
-                output = self.ssh_session.read_output()
-                
-                if output:
-                    print(f"[DEBUG] 读取到SSH输出: {len(output)} 字节")
-                
-                # ⭐ 获取纯文本显示
-                self.terminal_text = self.ssh_session.get_display()
-                
-                # 只在内容变化时更新和打印调试信息
-                if self.terminal_text != last_text:
-                    print(f"[DEBUG] 终端内容变化，新长度: {len(self.terminal_text)}")
-                    print(f"[DEBUG] 前100字符: {self.terminal_text[:100]!r}")
-                    last_text = self.terminal_text
+                # 光标闪烁逻辑（每500ms切换一次）
+                current_time = time.time()
+                if current_time - last_cursor_toggle > 0.5:
+                    cursor_visible = not cursor_visible
+                    last_cursor_toggle = current_time
                     
-                    # ⭐ FormattedTextControl 会自动从 lambda 获取最新内容
-                    # 只需要刷新UI即可
+                    # 只在光标切换时更新显示
+                    self.terminal_text = self.ssh_session.get_display(show_cursor=cursor_visible)
                     self.app.invalidate()
             
-            await asyncio.sleep(0.02)  # 提高到50fps刷新率，减少延迟感
+            # 光标闪烁刷新：每50ms检查一次就够了
+            await asyncio.sleep(0.05)
     
     def run(self):
         """运行应用"""
