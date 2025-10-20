@@ -1,0 +1,19 @@
+[project]
+name = "ssh-remote"
+version = "0.1.0"
+description = "AI-powered SSH remote command assistant with intelligent command generation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "textual>=0.47.0",
+    "rich>=13.7.0",
+    "paramiko>=3.4.0",
+    "openai>=1.12.0",
+    "cryptography>=42.0.0",
+    "sqlalchemy>=2.0.0",
+    "pydantic>=2.6.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+ssh-remote = "ssh_remote.main:run"
