@@ -15,11 +15,13 @@ from prompt_toolkit.layout import (
     Window,
     Layout,
     FormattedTextControl,
+    BufferControl,
     UIControl,
     UIContent,
     ConditionalContainer,
     FloatContainer,
     Float,
+    processors,
 )
 from prompt_toolkit.widgets import TextArea, Frame
 from prompt_toolkit.formatted_text import ANSI, HTML
@@ -27,63 +29,6 @@ from prompt_toolkit.filters import Condition
 
 from ssh_remote.models import Server, AuthMethod
 from ssh_remote.services.ai_service import AIAssistant
-
-
-class TerminalInputControl(UIControl):
-    """
-    自定义的终端控件：显示SSH终端输出
-    
-    注意：键盘输入由全局键绑定处理（带条件过滤器）
-    这个控件只负责显示内容
-    """
-    
-    def __init__(self, terminal_text_getter: Callable[[], str]):
-        """
-        Args:
-            terminal_text_getter: 获取终端显示文本的函数
-        """
-        self.terminal_text_getter = terminal_text_getter
-    
-    def create_content(self, width: int, height: int) -> UIContent:
-        """
-        创建显示内容：显示SSH终端输出（带ANSI颜色）
-        """
-        terminal_text = self.terminal_text_getter()
-        
-        # 将文本分割成行
-        lines = terminal_text.split('\n')
-        
-        # 确保至少有 height 行
-        while len(lines) < height:
-            lines.append('')
-        
-        # 只取需要的行数
-        lines = lines[:height]
-        
-        def get_line(i):
-            if i < len(lines):
-                # ANSI 对象需要转换为 formatted text 列表
-                # ANSI 对象本身就是一个可迭代的 formatted text
-                # 但我们需要调用它来获取片段列表
-                ansi_text = ANSI(lines[i])
-                # ANSI 类实现了 __pt_formatted_text__() 方法
-                # 直接返回它即可，prompt_toolkit 会自动处理
-                return ansi_text.__pt_formatted_text__()
-            return []
-        
-        return UIContent(
-            get_line=get_line,
-            line_count=len(lines),
-            cursor_position=None,  # 光标由SSH服务器控制
-        )
-    
-    def is_focusable(self) -> bool:
-        """允许获得焦点"""
-        return True
-    
-    def mouse_handler(self, mouse_event):
-        """鼠标事件处理（可选）"""
-        return NotImplemented
 
 
 class SSHTerminalSession:
@@ -164,7 +109,11 @@ class SSHTerminalSession:
     def send_input(self, data: str):
         """发送输入到SSH通道"""
         if self.channel and self.connected:
+            # print(f"[DEBUG] send_input: 发送 {data!r}")
             self.channel.send(data)
+            # ⭐ 立即尝试读取回显（给一点时间）
+            import time
+            time.sleep(0.01)  # 等待10ms让服务器回显
     
     def send_key(self, key: str):
         """发送特殊按键"""
@@ -203,8 +152,13 @@ class SSHTerminalSession:
             return ""
         
         try:
-            if self.channel.recv_ready():
+            # ⭐ 先检查 recv_ready
+            ready = self.channel.recv_ready()
+            # print(f"[DEBUG] recv_ready: {ready}")  # 太频繁，注释掉
+            
+            if ready:
                 data = self.channel.recv(4096).decode('utf-8', errors='replace')
+                # print(f"[DEBUG] read_output: 收到 {len(data)} 字节: {data[:50]!r}")
                 # 保存原始输出（包含ANSI颜色）
                 self.output_buffer += data
                 # 限制缓冲区大小
@@ -212,9 +166,15 @@ class SSHTerminalSession:
                     self.output_buffer = self.output_buffer[-40000:]
                 # 更新终端屏幕
                 self.stream.feed(data)
+                # print(f"[DEBUG] pyte屏幕已更新，光标位置: {self.screen.cursor.y}, {self.screen.cursor.x}")
                 return data
+            else:
+                # ⭐ 尝试强制读取（即使 recv_ready 为 False）
+                # 使用 select 或 直接尝试 recv（可能会阻塞）
+                # 暂时不做，先看看问题在哪
+                pass
         except Exception as e:
-            pass
+            print(f"[DEBUG] read_output 异常: {e}")
         
         return ""
     
@@ -314,10 +274,16 @@ class TerminalApp:
         # 终端显示文本
         self.terminal_text = ""
         
-        # ⭐ 创建自定义的终端控件（只负责显示）
-        # 输入由全局键绑定处理
-        self.terminal_input_control = TerminalInputControl(
-            terminal_text_getter=lambda: self.terminal_text,
+        # ⭐ 创建终端控件的键绑定（控件专属）
+        self.terminal_kb = self._create_terminal_key_bindings()
+        
+        # ⭐ 使用 FormattedTextControl 显示终端内容
+        # FormattedTextControl 支持 key_bindings 并且更适合显示动态内容
+        self.terminal_control = FormattedTextControl(
+            text=lambda: self.terminal_text,  # 动态获取内容
+            key_bindings=self.terminal_kb,
+            focusable=True,
+            show_cursor=False,  # 暂时隐藏光标
         )
         
         # AI聊天区域（只读）
@@ -344,8 +310,8 @@ class TerminalApp:
         # 创建布局
         self.layout = self._create_layout()
         
-        # 创建按键绑定
-        self.kb = self._create_key_bindings()
+        # 创建全局按键绑定
+        self.kb = self._create_global_key_bindings()
         
         # 创建应用
         self.app = Application(
@@ -356,19 +322,218 @@ class TerminalApp:
             enable_page_navigation_bindings=False,
         )
     
+    def _create_terminal_key_bindings(self) -> KeyBindings:
+        """
+        ⭐ 创建终端控件专属的键绑定
+        这些键绑定只在终端控件获得焦点时生效
+        """
+        kb = KeyBindings()
+        
+        # Enter 键
+        @kb.add('enter', eager=True)
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('enter')
+                # ⭐ Enter 后等待命令执行结果，持续读取
+                import time
+                max_attempts = 30  # 最多尝试30次（600ms），给命令执行更多时间
+                no_data_count = 0
+                
+                for attempt in range(max_attempts):
+                    time.sleep(0.02)
+                    output = self.ssh_session.read_output()
+                    
+                    if output:
+                        self.terminal_text = self.ssh_session.get_display()
+                        event.app.invalidate()
+                        no_data_count = 0
+                    else:
+                        no_data_count += 1
+                        # Enter后需要更长的等待时间，因为可能有命令执行
+                        if no_data_count >= 5:  # 连续5次（100ms）没数据才停止
+                            break
+            # ⭐ 不要调用 event.current_buffer 的任何方法
+            # 让键绑定"吞掉"这个事件
+        
+        # Backspace
+        @kb.add('backspace', eager=True)
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('backspace')
+                # 立即读取回显
+                import time
+                for _ in range(5):
+                    time.sleep(0.02)
+                    output = self.ssh_session.read_output()
+                    if output:
+                        self.terminal_text = self.ssh_session.get_display()
+                        event.app.invalidate()
+                        break
+        
+        # Tab
+        @kb.add('tab', eager=True)
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('tab')
+        
+        # Escape
+        @kb.add('escape')
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('escape')
+        
+        # 方向键
+        @kb.add('up')
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('up')
+                # 方向键也需要读取回显（可能有命令历史）
+                import time
+                for _ in range(10):
+                    time.sleep(0.02)
+                    output = self.ssh_session.read_output()
+                    if output:
+                        self.terminal_text = self.ssh_session.get_display()
+                        event.app.invalidate()
+                        break
+        
+        @kb.add('down')
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('down')
+                import time
+                for _ in range(10):
+                    time.sleep(0.02)
+                    output = self.ssh_session.read_output()
+                    if output:
+                        self.terminal_text = self.ssh_session.get_display()
+                        event.app.invalidate()
+                        break
+        
+        @kb.add('left')
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('left')
+                import time
+                for _ in range(5):
+                    time.sleep(0.02)
+                    output = self.ssh_session.read_output()
+                    if output:
+                        self.terminal_text = self.ssh_session.get_display()
+                        event.app.invalidate()
+                        break
+        
+        @kb.add('right')
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('right')
+                import time
+                for _ in range(5):
+                    time.sleep(0.02)
+                    output = self.ssh_session.read_output()
+                    if output:
+                        self.terminal_text = self.ssh_session.get_display()
+                        event.app.invalidate()
+                        break
+        
+        # Home/End
+        @kb.add('home')
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('home')
+        
+        @kb.add('end')
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('end')
+        
+        # PageUp/PageDown
+        @kb.add('pageup')
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('pageup')
+        
+        @kb.add('pagedown')
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('pagedown')
+        
+        # Delete
+        @kb.add('delete')
+        def _(event):
+            if self.ssh_session and self.ssh_session.connected:
+                self.ssh_session.send_key('delete')
+        
+        # Ctrl 组合键（除了 Q 和 T，这些由全局键绑定处理）
+        for char in 'abcdefghijklmnoprsuvwxyz':  # 排除 q, t
+            @kb.add(f'c-{char}')
+            def _(event, c=char):
+                if self.ssh_session and self.ssh_session.connected:
+                    self.ssh_session.send_ctrl_key(c)
+        
+        # ⭐ 为所有可打印字符单独注册键绑定
+        # 包括：字母、数字、标点符号、空格等
+        printable_chars = (
+            'abcdefghijklmnopqrstuvwxyz'
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+            '0123456789'
+            ' !"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~'
+        )
+        
+        for char in printable_chars:
+            @kb.add(char, eager=True)  # ⭐ eager=True 确保立即处理
+            def _(event, c=char):
+                """处理单个字符输入，并阻止默认行为"""
+                if self.ssh_session and self.ssh_session.connected:
+                    self.ssh_session.send_input(c)
+                    
+                    # ⭐ 立即读取输出并更新显示
+                    # 对于远程服务器，持续读取直到没有新数据
+                    import time
+                    max_attempts = 10  # 最多尝试10次（200ms）
+                    no_data_count = 0  # 连续没数据的次数
+                    
+                    for attempt in range(max_attempts):
+                        time.sleep(0.02)  # 每次等待20ms
+                        output = self.ssh_session.read_output()
+                        
+                        if output:
+                            # 有数据，立即更新显示
+                            self.terminal_text = self.ssh_session.get_display()
+                            event.app.invalidate()
+                            no_data_count = 0  # 重置计数器
+                        else:
+                            no_data_count += 1
+                            # 如果连续2次（40ms）没数据，认为回显完成
+                            if no_data_count >= 2:
+                                break
+                # ⭐ 不调用 event.current_buffer.insert_text()
+                # 这样字符就不会被插入到 Buffer 中
+        
+        return kb
+    
     def _create_layout(self) -> Layout:
         """创建应用布局（双面板+状态栏）"""
         
         # ⭐ 左侧：SSH终端窗口
-        # 显示由自定义控件处理，输入由全局键绑定+条件过滤器处理
-        self.terminal_input_window = Window(
-            content=self.terminal_input_control,
+        # 使用自定义 UIControl 来显示 SSH 输出，但使用 BufferControl 来处理输入
+        # 创建一个叠加层：底层是SSH显示，上层是透明的BufferControl
+        
+        # 创建 SSH 输出显示控件
+        ssh_display_control = FormattedTextControl(
+            text=lambda: ANSI(self.terminal_text),
+            focusable=False,  # 不可聚焦
+        )
+        
+        # 使用 FormattedTextControl 显示终端
+        self.terminal_window_obj = Window(
+            content=self.terminal_control,
             wrap_lines=False,
             always_hide_cursor=False,
         )
         
         terminal_window = Frame(
-            self.terminal_input_window,
+            self.terminal_window_obj,
             title=lambda: "🖥️  SSH Terminal" + (" [FOCUS]" if self.terminal_focused else ""),
         )
         
@@ -423,89 +588,35 @@ class TerminalApp:
         """切换到终端模式"""
         self.terminal_focused = True
         self._update_status()
-        # 直接聚焦到我们保存的输入窗口
-        self.app.layout.focus(self.terminal_input_window)
+        # 聚焦到终端窗口
+        self.app.layout.focus(self.terminal_window_obj)
     
-    def _create_key_bindings(self) -> KeyBindings:
-        """创建全局按键绑定"""
+    def _create_global_key_bindings(self) -> KeyBindings:
+        """
+        ⭐ 创建全局按键绑定（只处理模式切换和退出）
+        终端输入由控件专属的键绑定处理
+        """
         kb = KeyBindings()
         
-        # ========== 条件过滤器 ==========
-        is_terminal_focused = Condition(lambda: self.terminal_focused)
-        is_chat_focused = Condition(lambda: not self.terminal_focused)
-        
-        # ========== 终端模式的所有按键（从 TerminalInputControl 复制过来）==========
-        # ⭐ 关键改变：将控件的键绑定移到全局，并添加 filter 条件
-        
-        @kb.add('c-q', filter=is_terminal_focused)
+        # Ctrl+T: 切换模式（全局有效）
+        @kb.add('c-t')
         def _(event):
-            """Ctrl+Q: 退出应用（终端模式）"""
+            """切换终端/聊天模式"""
+            if self.terminal_focused:
+                self._switch_to_chat()
+            else:
+                self._switch_to_terminal()
+        
+        # Ctrl+Q: 退出应用（全局有效）
+        @kb.add('c-q')
+        def _(event):
+            """退出应用"""
             event.app.exit()
         
-        @kb.add('c-t', filter=is_terminal_focused)
-        def _(event):
-            """Ctrl+T: 切换到聊天模式"""
-            self._switch_to_chat()
-        
-        # 功能键
-        @kb.add('enter', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session and self.ssh_session.connected:
-                self.ssh_session.send_key('enter')
-        
-        @kb.add('backspace', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session and self.ssh_session.connected:
-                self.ssh_session.send_key('backspace')
-        
-        @kb.add('tab', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session and self.ssh_session.connected:
-                self.ssh_session.send_key('tab')
-        
-        @kb.add('escape', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session and self.ssh_session.connected:
-                self.ssh_session.send_key('escape')
-        
-        # 方向键
-        for key in ['up', 'down', 'left', 'right', 'home', 'end', 'pageup', 'pagedown', 'delete']:
-            @kb.add(key, filter=is_terminal_focused)
-            def _(event, k=key):
-                if self.ssh_session and self.ssh_session.connected:
-                    self.ssh_session.send_key(k)
-        
-        # Ctrl 组合键（除了 Q 和 T）
-        for char in 'abcdefghijklmnoprsuvwxyz':  # 排除 q, t
-            @kb.add(f'c-{char}', filter=is_terminal_focused)
-            def _(event, c=char):
-                if self.ssh_session and self.ssh_session.connected:
-                    self.ssh_session.send_ctrl_key(c)
-        
-        # 普通字符（使用 <any> 通配符）
-        @kb.add('<any>', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session and self.ssh_session.connected:
-                key = event.key_sequence[0].key
-                # 确保是单个字符
-                if len(key) == 1:
-                    self.ssh_session.send_input(key)
-        
-        # ========== 聊天模式的快捷键 ==========
-        
-        @kb.add('c-q', filter=is_chat_focused)
-        def _(event):
-            """Ctrl+Q: 退出应用（聊天模式）"""
-            event.app.exit()
-        
-        @kb.add('c-t', filter=is_chat_focused)
-        def _(event):
-            """Ctrl+T: 切换到终端模式"""
-            self._switch_to_terminal()
-        
-        @kb.add('enter', filter=is_chat_focused)
+        # Enter: 在聊天输入框中发送消息
+        @kb.add('enter', filter=Condition(lambda: not self.terminal_focused))
         async def _(event):
-            """Enter: 发送AI消息"""
+            """发送AI消息"""
             await self._handle_ai_input()
         
         return kb
@@ -577,12 +688,16 @@ class TerminalApp:
                 await asyncio.sleep(0.5)  # 给服务器更多时间
                 self.ssh_session.read_output()  # 再次读取
                 
-                # 获取初始终端输出（包括提示符）
-                self.terminal_text = self.ssh_session.get_colored_display()
+                # 获取初始终端输出（包括提示符）- 使用纯文本
+                self.terminal_text = self.ssh_session.get_display()
                 
                 # 如果还是空的，显示一个提示
                 if not self.terminal_text.strip():
                     self.terminal_text = "🖥️  已连接到服务器，等待输出...\n(尝试按 Enter 键显示提示符)"
+                
+                # ⭐ terminal_text 已经设置好，FormattedTextControl 会自动显示
+                print(f"[DEBUG] 初始化终端显示，内容长度: {len(self.terminal_text)}")
+                print(f"[DEBUG] 内容前100字符: {self.terminal_text[:100]!r}")
                 
                 self.chat_area.text = "👋 你好！我是AI助手。\n\n📌 使用指南:\n• 左侧是SSH终端，可以直接输入命令\n• 右侧可以向我描述需求，我会帮你生成命令\n• 按 Ctrl+T 切换左右面板焦点\n• 按 Ctrl+Q 退出应用"
                 
@@ -609,18 +724,29 @@ class TerminalApp:
     
     async def update_terminal_display(self):
         """更新终端显示（实时刷新）"""
+        last_text = ""
         while self.running:
             if self.ssh_session and self.ssh_session.connected:
                 # 读取SSH输出
                 output = self.ssh_session.read_output()
                 
-                # 始终更新显示（即使没有新输出，也要反映当前屏幕状态）
-                self.terminal_text = self.ssh_session.get_colored_display()
+                if output:
+                    print(f"[DEBUG] 读取到SSH输出: {len(output)} 字节")
                 
-                # 始终刷新UI（确保用户输入能实时显示）
-                self.app.invalidate()
+                # ⭐ 获取纯文本显示
+                self.terminal_text = self.ssh_session.get_display()
+                
+                # 只在内容变化时更新和打印调试信息
+                if self.terminal_text != last_text:
+                    print(f"[DEBUG] 终端内容变化，新长度: {len(self.terminal_text)}")
+                    print(f"[DEBUG] 前100字符: {self.terminal_text[:100]!r}")
+                    last_text = self.terminal_text
+                    
+                    # ⭐ FormattedTextControl 会自动从 lambda 获取最新内容
+                    # 只需要刷新UI即可
+                    self.app.invalidate()
             
-            await asyncio.sleep(0.05)  # 20fps刷新率
+            await asyncio.sleep(0.02)  # 提高到50fps刷新率，减少延迟感
     
     def run(self):
         """运行应用"""
