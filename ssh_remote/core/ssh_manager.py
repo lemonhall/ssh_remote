@@ -1,7 +1,9 @@
 """SSH connection management."""
 
-from typing import Optional
+from typing import Optional, Callable
 import paramiko
+import threading
+import time
 from ssh_remote.config import settings
 from ssh_remote.models import Server
 
@@ -13,6 +15,9 @@ class SSHConnection:
         self.server = server
         self.client: Optional[paramiko.SSHClient] = None
         self._connected = False
+        self.shell_channel: Optional[paramiko.Channel] = None
+        self._output_callback: Optional[Callable[[str], None]] = None
+        self._output_thread: Optional[threading.Thread] = None
     
     def connect(self, password: Optional[str] = None) -> bool:
         """
@@ -70,8 +75,54 @@ class SSHConnection:
             exit_code
         )
     
+    def start_shell(self, output_callback: Callable[[str], None]):
+        """
+        Start an interactive shell session.
+        
+        Args:
+            output_callback: Function to call with shell output
+        """
+        if not self._connected or not self.client:
+            raise RuntimeError("Not connected to server")
+        
+        self._output_callback = output_callback
+        self.shell_channel = self.client.invoke_shell(term='xterm', width=120, height=40)
+        
+        # Start output reading thread
+        self._output_thread = threading.Thread(target=self._read_shell_output, daemon=True)
+        self._output_thread.start()
+    
+    def _read_shell_output(self):
+        """Read output from shell in background thread."""
+        try:
+            while self.shell_channel and not self.shell_channel.closed:
+                if self.shell_channel.recv_ready():
+                    output = self.shell_channel.recv(4096).decode('utf-8', errors='replace')
+                    if output and self._output_callback:
+                        self._output_callback(output)
+                else:
+                    time.sleep(0.01)
+        except Exception as e:
+            if self._output_callback:
+                self._output_callback(f"\n[Error reading output: {e}]\n")
+    
+    def send_to_shell(self, command: str):
+        """
+        Send a command to the interactive shell.
+        
+        Args:
+            command: Command to send (will append newline)
+        """
+        if not self.shell_channel or self.shell_channel.closed:
+            raise RuntimeError("Shell not started")
+        
+        # Send command with newline
+        self.shell_channel.send(command + '\n')
+    
     def disconnect(self):
         """Close the SSH connection."""
+        if self.shell_channel:
+            self.shell_channel.close()
         if self.client:
             self.client.close()
             self._connected = False

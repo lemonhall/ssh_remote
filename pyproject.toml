@@ -5,8 +5,8 @@ description = "AI-powered SSH remote command assistant with intelligent command 
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "textual>=0.47.0",
-    "rich>=13.7.0",
+    "prompt-toolkit>=3.0.43",
+    "pyte>=0.8.2",
     "paramiko>=3.4.0",
     "openai>=1.12.0",
     "cryptography>=42.0.0",

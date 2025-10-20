@@ -1,12 +1,11 @@
 """Main entry point for SSH Remote Assistant."""
 
-from ssh_remote.ui.app import SSHRemoteApp
+from ssh_remote.ui.terminal_app import main
 
 
 def run():
     """Run the SSH Remote Assistant application."""
-    app = SSHRemoteApp()
-    app.run()
+    main()
 
 
 if __name__ == "__main__":

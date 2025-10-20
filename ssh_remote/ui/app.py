@@ -3,34 +3,31 @@
 import json
 from pathlib import Path
 from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import Header, Footer, Static, Input, Button
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.widgets import Header, Footer, Static, Input, Button, RichLog
 from textual.binding import Binding
 from ssh_remote.models import Server, AuthMethod
 from ssh_remote.core.ssh_manager import SSHConnection
 
 
 class SSHTerminalPanel(Static):
-    """Left panel showing SSH terminal output."""
-    
-    def __init__(self):
-        super().__init__()
-        self.output_lines: list[str] = []
+    """Left panel showing interactive SSH terminal."""
     
     def compose(self) -> ComposeResult:
-        yield Static("SSH Terminal Output", classes="panel-title")
-        yield Static("", id="terminal-content", classes="terminal-output")
-        yield Input(placeholder="输入SSH命令 (例如: ls -la)...", id="terminal-input")
+        yield Static("SSH Interactive Terminal", classes="panel-title")
+        yield RichLog(id="terminal-content", wrap=True, highlight=False, markup=False, max_lines=5000)
+        yield Input(placeholder="输入命令...", id="terminal-input")
+    
+    def append_output(self, text: str):
+        """Append text to terminal output (for streaming shell output)."""
+        terminal = self.query_one("#terminal-content", RichLog)
+        # RichLog 的 write 方法会自动滚动到底部
+        terminal.write(text)
     
     def add_output(self, text: str):
-        """Add text to terminal output."""
-        self.output_lines.append(text)
-        # Keep last 100 lines
-        if len(self.output_lines) > 100:
-            self.output_lines = self.output_lines[-100:]
-        
-        terminal = self.query_one("#terminal-content", Static)
-        terminal.update("\n".join(self.output_lines))
+        """Add a line to terminal output."""
+        terminal = self.query_one("#terminal-content", RichLog)
+        terminal.write(text)
 
 
 class ChatPanel(Static):
@@ -93,9 +90,9 @@ class SSHRemoteApp(App):
         margin-bottom: 1;
     }
     
-    .terminal-output {
+    #terminal-content {
         height: 1fr;
-        overflow-y: auto;
+        border: solid $primary;
         margin-bottom: 1;
     }
     
@@ -187,8 +184,10 @@ class SSHRemoteApp(App):
             
             terminal.add_output(f"✅ 成功连接到 {self.server.host}")
             terminal.add_output(f"👤 用户: {self.server.username}")
-            terminal.add_output("")
-            terminal.add_output("💡 在左侧输入框输入命令 (例如: ls -la)")
+            terminal.add_output("🔄 正在启动交互式Shell...")
+            
+            # Start interactive shell
+            self.ssh_connection.start_shell(self._handle_shell_output)
             
             self.sub_title = f"Connected to {self.server.name}"
             
@@ -199,27 +198,23 @@ class SSHRemoteApp(App):
         except Exception as e:
             terminal.add_output(f"❌ 连接失败: {str(e)}")
     
-    def execute_ssh_command(self, command: str):
-        """Execute a command via SSH."""
+    def _handle_shell_output(self, output: str):
+        """Handle output from interactive shell."""
         terminal = self.query_one(SSHTerminalPanel)
-        
+        terminal.append_output(output)
+    
+    def send_command_to_shell(self, command: str):
+        """Send a command to the interactive shell."""
         if not self.ssh_connection or not self.ssh_connection.is_connected:
+            terminal = self.query_one(SSHTerminalPanel)
             terminal.add_output("❌ 未连接到服务器")
             return
         
         try:
-            terminal.add_output(f"\n$ {command}")
-            stdout, stderr, exit_code = self.ssh_connection.execute_command(command)
-            
-            if stdout:
-                terminal.add_output(stdout.rstrip())
-            if stderr:
-                terminal.add_output(f"[stderr] {stderr.rstrip()}")
-            if exit_code != 0:
-                terminal.add_output(f"[exit code: {exit_code}]")
-                
+            self.ssh_connection.send_to_shell(command)
         except Exception as e:
-            terminal.add_output(f"❌ 命令执行失败: {str(e)}")
+            terminal = self.query_one(SSHTerminalPanel)
+            terminal.add_output(f"❌ 命令发送失败: {str(e)}")
     
     def on_input_submitted(self, event: Input.Submitted):
         """Handle input submission."""
@@ -227,21 +222,21 @@ class SSHRemoteApp(App):
         if not user_input:
             return
         
-        # Handle terminal input (SSH commands)
+        # Handle terminal input - send directly to shell
         if event.input.id == "terminal-input":
-            self.execute_ssh_command(user_input)
+            self.send_command_to_shell(user_input)
             event.input.value = ""
             return
         
-        # Handle chat input (AI chat)
+        # Handle chat input - AI assistance (for now, just suggest the command)
         if event.input.id == "chat-input":
             chat = self.query_one(ChatPanel)
             chat.add_message("user", user_input)
             event.input.value = ""
             
-            # TODO: Process with AI and execute commands
-            # For now, just echo back
-            chat.add_message("assistant", f"收到你的需求：{user_input}\n（AI集成开发中...）")
+            # TODO: Use AI to generate command
+            # For now, echo back and provide option to send
+            chat.add_message("assistant", f"建议命令: {user_input}\n(点击命令或直接在左侧输入执行)")
             return
     
     def on_unmount(self):
