@@ -262,7 +262,7 @@ class TerminalApp:
             text="",
             height=0,  # 高度为0，不可见
             focusable=True,
-            read_only=True,
+            read_only=False,  # 必须是可写的，否则无法接收输入
         )
         
         # AI聊天区域（只读）
@@ -291,6 +291,10 @@ class TerminalApp:
         
         # 创建按键绑定
         self.kb = self._create_key_bindings()
+        
+        # 为 dummy_control 创建专门的键绑定
+        self.dummy_kb = self._create_dummy_key_bindings()
+        self.dummy_control.control.key_bindings = self.dummy_kb
         
         # 创建应用
         self.app = Application(
@@ -360,6 +364,64 @@ class TerminalApp:
         
         return Layout(root)
     
+    def _create_dummy_key_bindings(self) -> KeyBindings:
+        """为虚拟控件创建键绑定（拦截所有输入并转发到SSH）"""
+        kb = KeyBindings()
+        
+        # 拦截所有按键并转发到SSH
+        @kb.add('<any>')
+        def _(event):
+            """转发所有按键到SSH"""
+            if self.ssh_session and self.ssh_session.connected:
+                # 获取按键信息
+                key = event.key_sequence[0].key
+                
+                # 处理特殊键
+                if key == 'enter':
+                    self.ssh_session.send_key('enter')
+                elif key == 'backspace':
+                    self.ssh_session.send_key('backspace')
+                elif key == 'tab':
+                    self.ssh_session.send_key('tab')
+                elif key == 'escape':
+                    self.ssh_session.send_key('escape')
+                elif key == 'up':
+                    self.ssh_session.send_key('up')
+                elif key == 'down':
+                    self.ssh_session.send_key('down')
+                elif key == 'left':
+                    self.ssh_session.send_key('left')
+                elif key == 'right':
+                    self.ssh_session.send_key('right')
+                elif key == 'home':
+                    self.ssh_session.send_key('home')
+                elif key == 'end':
+                    self.ssh_session.send_key('end')
+                elif key == 'pageup':
+                    self.ssh_session.send_key('pageup')
+                elif key == 'pagedown':
+                    self.ssh_session.send_key('pagedown')
+                elif key == 'delete':
+                    self.ssh_session.send_key('delete')
+                elif key.startswith('c-') and len(key) == 3:
+                    # Ctrl组合键
+                    char = key[2]
+                    if char == 'q':
+                        # Ctrl+Q 退出，不转发
+                        event.app.exit()
+                    elif char == 't':
+                        # Ctrl+T 切换焦点，不转发
+                        self.terminal_focused = False
+                        self._update_status()
+                        event.app.layout.focus(self.input_field)
+                    else:
+                        self.ssh_session.send_ctrl_key(char)
+                elif len(key) == 1:
+                    # 普通字符
+                    self.ssh_session.send_input(key)
+        
+        return kb
+    
     def _create_key_bindings(self) -> KeyBindings:
         """创建按键绑定"""
         kb = KeyBindings()
@@ -385,151 +447,10 @@ class TerminalApp:
                 # 切换到终端模式，给虚拟控件焦点（让我们的键绑定生效）
                 event.app.layout.focus(self.dummy_control)
         
-        # ========== 终端焦点时的按键处理 ==========
-        
-        # 创建Filter条件
-        is_terminal_focused = Condition(lambda: self.terminal_focused)
-        is_chat_focused = Condition(lambda: not self.terminal_focused)
-        
-        # 字母和数字键
-        for char in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789':
-            @kb.add(char, filter=is_terminal_focused)
-            def _(event, c=char):
-                if self.ssh_session:
-                    self.ssh_session.send_input(c)
-        
-        # 符号键
-        symbols = '`~!@#$%^&*()-_=+[{]}\\|;:\'",<.>/? '
-        for char in symbols:
-            @kb.add(char, filter=is_terminal_focused)
-            def _(event, c=char):
-                if self.ssh_session:
-                    self.ssh_session.send_input(c)
-        
-        # 特殊键
-        @kb.add('enter', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_key('enter')
-        
-        @kb.add('backspace', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_key('backspace')
-        
-        @kb.add('tab', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_key('tab')
-        
-        @kb.add('space', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_input(' ')
-        
-        @kb.add('escape', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_key('escape')
-        
-        # 方向键
-        @kb.add('up', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_key('up')
-        
-        @kb.add('down', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_key('down')
-        
-        @kb.add('left', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_key('left')
-        
-        @kb.add('right', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_key('right')
-        
-        @kb.add('home', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_key('home')
-        
-        @kb.add('end', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_key('end')
-        
-        @kb.add('pageup', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_key('pageup')
-        
-        @kb.add('pagedown', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_key('pagedown')
-        
-        @kb.add('delete', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_key('delete')
-        
-        # Ctrl组合键（常用的）
-        @kb.add('c-a', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_ctrl_key('a')
-        
-        @kb.add('c-b', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_ctrl_key('b')
-        
-        @kb.add('c-c', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_ctrl_key('c')
-        
-        @kb.add('c-d', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_ctrl_key('d')
-        
-        @kb.add('c-e', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_ctrl_key('e')
-        
-        @kb.add('c-k', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_ctrl_key('k')
-        
-        @kb.add('c-l', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_ctrl_key('l')
-        
-        @kb.add('c-u', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_ctrl_key('u')
-        
-        @kb.add('c-w', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_ctrl_key('w')
-        
-        @kb.add('c-z', filter=is_terminal_focused)
-        def _(event):
-            if self.ssh_session:
-                self.ssh_session.send_ctrl_key('z')
-        
         # ========== AI聊天焦点时的按键处理 ==========
+        # 注意：终端模式的按键由 dummy_control 的键绑定处理
+        
+        is_chat_focused = Condition(lambda: not self.terminal_focused)
         
         @kb.add('enter', filter=is_chat_focused)
         async def _(event):

@@ -58,37 +58,75 @@
   - `layout.focus(None)` 报错，无法正确实现"无焦点"状态
   - 需要重新设计焦点管理方案
 
-### � 当前问题 (2025-10-21 晚)
+### 🔴 当前问题 (2025-10-21 深夜 - 第二轮调试)
 
-#### 焦点管理问题
-**症状**：
-- SSH终端可以显示提示符和输出
-- 但无法接收键盘输入
-- 尝试用 `layout.focus(None)` 实现"无焦点"模式失败
-- 错误：`ValueError: Not a container object: None`
+#### 阶段性进展
+- ✅ 修复了 `focus(None)` 报错 → 创建虚拟 `dummy_control` TextArea
+- ✅ SSH终端可以正常显示内容（欢迎信息、提示符、ANSI颜色）
+- ✅ 状态栏正常，Ctrl+T 焦点切换不报错
+- ✅ 右侧聊天面板可以正常输入（当焦点切换到聊天模式时）
+- ❌ **左侧终端仍然无法接收键盘输入**
 
-**根本原因**：
-- prompt_toolkit要求始终有一个Widget获得焦点
-- TextArea组件会捕获所有输入，干扰自定义键绑定
-- 使用Filter条件无法完全阻止TextArea接收输入
-- 当前的"双焦点"设计（终端模式 vs 聊天模式）与框架机制冲突
+#### 核心问题：TextArea 的输入拦截机制
+**已尝试的方案**：
 
-**需要的解决方案**：
-1. **方案A**: 创建一个虚拟的隐藏Widget作为终端模式的焦点目标
-2. **方案B**: 完全重构，使用自定义的Window而非TextArea
-3. **方案C**: 放弃双面板交互，改为模态切换（要么全屏终端，要么全屏聊天）
-4. **方案D**: 研究prompt_toolkit的input_processors自定义输入处理
+**方案A（已测试 ❌ 失败）**: 隐藏 TextArea + 自定义键绑定
+- 创建了高度为0的虚拟TextArea (`dummy_control`) 作为焦点目标
+- 为其绑定了专用的 `_create_dummy_key_bindings()` 方法
+- 使用 `<any>` 通配符捕获所有按键并转发到SSH
+- **问题**：TextArea 的 `BufferControl` 优先级更高，在键绑定之前就消费了输入事件
 
-## 📋 下一步计划
+**根本原因分析**：
+- TextArea 内部有 `BufferControl` 和 `Buffer`，会优先处理所有输入
+- 键绑定（KeyBindings）在处理链中优先级低于 Widget 内部处理器
+- `control.key_bindings` 设置无效，因为 BufferControl 自己的处理器先执行
+- prompt_toolkit 设计哲学：**拥有焦点的 Widget 控制输入，而非全局键绑定**
 
-### 🎯 优先级1: 修复终端输入（需重新设计）
-- [ ] 重新评估UI架构方案
-- [ ] 解决焦点管理问题
-- [ ] 实现可用的终端输入
-  
+**教训**：
+❌ TextArea 不适合作为"透明"的输入转发器
+❌ 即使设置 `read_only=False` 也无法阻止其消费按键
+❌ 使用 Filter 条件只能控制键绑定触发，但无法阻止 Widget 内部处理
+
+**可行的解决方案**：
+
+1. **方案B（推荐 ⭐）**: 自定义 UIControl 代替 TextArea
+   - 创建一个继承 `UIControl` 的 `TerminalInputControl`
+   - 重写 `create_content()` 返回空内容（不可见）
+   - 在 `key_handler()` 中处理所有输入并转发到SSH
+   - 完全掌控输入处理流程
+
+2. **方案C**: 使用 input_processors 拦截
+   - 为 dummy_control 添加自定义 `Processor`
+   - 在 `apply_transformation()` 中拦截输入
+   - 可能仍然会被 Buffer 消费
+
+3. **方案D**: 全屏模式切换（最简单 🎯）
+   - 放弃双面板同时交互
+   - 终端模式：全屏SSH终端
+   - 聊天模式：全屏AI对话
+   - Ctrl+T 切换布局
+
+4. **方案E**: 研究 `PromptSession` 集成
+   - 使用 prompt_toolkit 的原生命令行输入
+   - 输入直接管道到 SSH
+
+## 📋 下一步计划（重新规划）
+
+### 🎯 优先级1: 彻底解决终端输入问题
+**必须二选一：**
+- [ ] **方案B**: 实现自定义 UIControl（技术难度高，但最优雅）
+- [ ] **方案D**: 改为全屏模式切换（最简单，立即可用）
+
+**推荐先尝试方案D**：
+1. 创建两套独立的布局（终端布局 + 聊天布局）
+2. Ctrl+T 切换 `app.layout`
+3. 终端布局使用真实的可输入 TextArea 或原生输入
+4. 如果方案D可用，再考虑优化回双面板
+
 ### 优先级2: 基础功能完善
 - [ ] 终端大小自适应
 - [ ] 实时输出刷新优化
+- [ ] 添加滚动缓冲区
   
 ### 优先级3: AI聊天集成
 - [ ] 右侧输入框功能
@@ -214,7 +252,7 @@ uv run python -m ssh_remote.main
 - 创建 SSHTerminalSession 类（SSH + 终端仿真）
 - 实现基础双面板布局
 
-**2025-10-21 晚上**:
+**2025-10-21 晚上第一轮**:
 - ✅ SSH连接成功，可显示服务器欢迎信息和提示符
 - ✅ 实现ANSI颜色支持
 - ✅ 完成所有键盘按键绑定（字母、数字、符号、方向键、Ctrl组合键等）
@@ -223,13 +261,18 @@ uv run python -m ssh_remote.main
 - ❌ **焦点管理失败** - prompt_toolkit不支持`focus(None)`
 - 🔴 **终端无法接收输入** - TextArea组件与键绑定冲突
 
-**问题总结**:
-prompt_toolkit的Widget体系与我们的"虚拟终端"设计理念不匹配。需要找到合适的方法让键盘事件直接到达我们的键绑定处理器，而不被TextArea拦截。
+**2025-10-21 深夜第二轮**:
+- ✅ 修复 `focus(None)` 错误 → 使用虚拟 dummy_control
+- ✅ 终端显示完全正常（pyte渲染优化）
+- ✅ 优化了 `get_colored_display()` 方法
+- ✅ 为 dummy_control 添加专用键绑定
+- ❌ **输入仍然无效** - TextArea的BufferControl优先级问题
 
-**下一步方向：**
-1. 研究创建自定义的focusable容器
-2. 或考虑使用单一的隐藏TextArea作为输入源
-3. 或完全重构为模态UI（终端/聊天二选一）
+**问题根源**:
+TextArea 不是"透明"的输入容器。它的内部 BufferControl 会在键绑定之前消费所有输入事件。这是 prompt_toolkit 的设计哲学：Widget 拥有输入控制权，而非全局键绑定。
+
+**结论**:
+必须放弃使用 TextArea 作为输入转发器。要么实现自定义 UIControl，要么改用全屏模式切换。
 
 ---
 
