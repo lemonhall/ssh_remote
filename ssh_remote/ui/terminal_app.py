@@ -274,6 +274,12 @@ class TerminalApp:
         # 终端显示文本
         self.terminal_text = ""
         
+        # AI生成的待执行命令
+        self.pending_commands: list[str] = []
+        
+        # 命令历史（用于AI上下文）
+        self.command_history: list[str] = []
+        
         # ⭐ 创建终端控件的键绑定（控件专属）
         self.terminal_kb = self._create_terminal_key_bindings()
         
@@ -620,14 +626,122 @@ class TerminalApp:
         self.chat_area.text = current_chat + f"\n\n🧑 You: {user_input}"
         
         try:
+            # 检查是否是执行命令的指令
+            if user_input.lower() in ['exec', 'execute']:
+                await self._execute_pending_commands()
+                return
+            elif user_input.lower().startswith('exec '):
+                # 执行指定序号的命令
+                try:
+                    cmd_index = int(user_input.split()[1]) - 1
+                    if 0 <= cmd_index < len(self.pending_commands):
+                        await self._execute_command(self.pending_commands[cmd_index])
+                    else:
+                        self.chat_area.text += f"\n\n❌ 无效的命令序号: {cmd_index + 1}"
+                except (ValueError, IndexError):
+                    self.chat_area.text += f"\n\n❌ 用法: exec N (N为命令序号)"
+                return
+            
             if self.ai_assistant:
-                # TODO: 调用AI生成命令
-                # 这里先显示一个占位消息
-                self.chat_area.text += f"\n\n🤖 AI: 收到！正在分析您的需求...\n（AI功能开发中）"
+                # 显示思考中的提示
+                self.chat_area.text += f"\n\n🤖 AI: 正在思考..."
+                self.app.invalidate()  # 强制刷新UI
+                
+                # 获取当前终端上下文（最后几行输出作为上下文）
+                context = None
+                if self.ssh_session and self.ssh_session.connected:
+                    terminal_lines = self.ssh_session.get_display().split('\n')
+                    # 取最后10行作为上下文
+                    context = '\n'.join(terminal_lines[-10:])
+                
+                # 调用AI生成命令
+                explanation, commands = await asyncio.to_thread(
+                    self.ai_assistant.generate_command,
+                    user_input,
+                    context
+                )
+                
+                # 更新聊天区，移除"思考中"提示
+                self.chat_area.text = self.chat_area.text.replace(
+                    "\n\n🤖 AI: 正在思考...",
+                    ""
+                )
+                
+                # 显示AI回复
+                self.chat_area.text += f"\n\n🤖 AI: {explanation}"
+                
+                # 显示生成的命令
+                if commands:
+                    self.chat_area.text += "\n\n📋 生成的命令："
+                    for i, cmd in enumerate(commands, 1):
+                        # 检查危险命令
+                        is_dangerous, warning = self.ai_assistant.check_dangerous_command(cmd)
+                        if is_dangerous:
+                            self.chat_area.text += f"\n  {i}. {cmd} {warning}"
+                        else:
+                            self.chat_area.text += f"\n  {i}. {cmd}"
+                    
+                    # 保存生成的命令供后续执行
+                    self.pending_commands = commands
+                    self.chat_area.text += "\n\n💡 提示：输入 'exec' 或 'execute' 执行所有命令"
+                    self.chat_area.text += "\n     输入 'exec N' 只执行第N个命令"
+                else:
+                    self.chat_area.text += "\n\n（未生成命令）"
             else:
                 self.chat_area.text += f"\n\n⚠️ AI助手未初始化（请配置OPENAI_API_KEY）"
         except Exception as e:
             self.chat_area.text += f"\n\n❌ 错误: {str(e)}"
+    
+    async def _execute_pending_commands(self):
+        """执行所有待执行的命令"""
+        if not self.pending_commands:
+            self.chat_area.text += "\n\n⚠️ 没有待执行的命令"
+            return
+        
+        if not self.ssh_session or not self.ssh_session.connected:
+            self.chat_area.text += "\n\n❌ SSH未连接"
+            return
+        
+        self.chat_area.text += "\n\n⚙️ 开始执行命令..."
+        
+        for i, cmd in enumerate(self.pending_commands, 1):
+            self.chat_area.text += f"\n  [{i}/{len(self.pending_commands)}] 执行: {cmd}"
+            self.app.invalidate()  # 刷新UI
+            
+            await self._execute_command(cmd, show_notification=False)
+            await asyncio.sleep(0.5)  # 命令之间间隔
+        
+        self.chat_area.text += "\n\n✅ 所有命令执行完成"
+        self.pending_commands = []  # 清空待执行列表
+    
+    async def _execute_command(self, command: str, show_notification: bool = True):
+        """执行单个命令"""
+        if not self.ssh_session or not self.ssh_session.connected:
+            if show_notification:
+                self.chat_area.text += "\n\n❌ SSH未连接"
+            return
+        
+        try:
+            # 记录命令历史
+            self.command_history.append(command)
+            
+            # 更新AI助手的命令历史上下文
+            if self.ai_assistant:
+                self.ai_assistant.set_command_history(self.command_history)
+            
+            # 发送命令到SSH
+            self.ssh_session.send_input(command + '\n')
+            
+            if show_notification:
+                self.chat_area.text += f"\n\n✅ 已发送命令: {command}"
+            
+            # 等待输出并刷新终端显示
+            await asyncio.sleep(0.3)
+            self.ssh_session.read_output()
+            
+        except Exception as e:
+            if show_notification:
+                self.chat_area.text += f"\n\n❌ 执行失败: {str(e)}"
     
     async def load_config_and_connect(self):
         """加载配置并连接SSH"""
@@ -680,7 +794,7 @@ class TerminalApp:
                 # 初始化AI助手（如果配置了API Key）
                 try:
                     from ssh_remote.config import settings
-                    if settings.OPENAI_API_KEY:
+                    if settings.openai_api_key:
                         self.ai_assistant = AIAssistant()
                         self.chat_area.text += "\n\n✅ AI助手已就绪"
                     else:

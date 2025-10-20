@@ -4,6 +4,10 @@ from pathlib import Path
 from typing import Optional
 from pydantic import BaseModel
 import os
+from dotenv import load_dotenv
+
+# 加载 .env 文件
+load_dotenv()
 
 
 class Settings(BaseModel):
@@ -15,6 +19,7 @@ class Settings(BaseModel):
     
     # AI Service
     openai_api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
+    openai_base_url: Optional[str] = os.getenv("OPENAI_BASE_URL")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4")
     openai_temperature: float = 0.7
     openai_max_tokens: int = 4000

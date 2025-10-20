@@ -13,7 +13,12 @@ class AIAssistant:
         if not settings.openai_api_key:
             raise ValueError("OpenAI API key not configured")
         
-        self.client = OpenAI(api_key=settings.openai_api_key)
+        # 初始化 OpenAI 客户端，支持自定义 base_url
+        client_kwargs = {"api_key": settings.openai_api_key}
+        if settings.openai_base_url:
+            client_kwargs["base_url"] = settings.openai_base_url
+        
+        self.client = OpenAI(**client_kwargs)
         self.conversation_history: list[ChatMessage] = []
         self.command_history: list[str] = []
     
